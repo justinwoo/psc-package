@@ -1,5 +1,5 @@
+{-# OPTIONS_GHC -fno-warn-type-defaults #-}
 {-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -11,26 +11,22 @@ module Main where
 
 import qualified Control.Foldl as Foldl
 import           Control.Concurrent.Async (forConcurrently_, mapConcurrently)
-import qualified Data.Aeson as Aeson
-import           Data.Aeson.Encode.Pretty
 import           Data.Foldable (fold, foldMap, traverse_)
 import qualified Data.Graph as G
 import           Data.List (maximumBy)
 import qualified Data.List as List
 import qualified Data.Map as Map
-import           Data.Maybe (fromMaybe, mapMaybe)
+import qualified Data.HashMap.Strict.InsOrd as HM
 import           Data.Ord (comparing)
 import qualified Data.Set as Set
 import           Data.Text (pack)
 import qualified Data.Text as T
-import           Data.Text.Encoding (encodeUtf8)
-import qualified Data.Text.Lazy as TL
-import qualified Data.Text.Lazy.Builder as TB
-import qualified Data.Text.Read as TR
-import           Data.Traversable (for)
 import           Data.Version (Version(..), parseVersion, showVersion)
+import qualified Dhall as Dhall
+import qualified Dhall.Core as Dhall.Core
+import qualified Dhall.Parser as Dhall.Parser
+import qualified Dhall.Format as Dhall.Format
 import qualified Filesystem.Path.CurrentOS as Path
-import           GHC.Generics (Generic)
 import qualified Options.Applicative as Opts
 import qualified Paths_psc_package as Paths
 import           System.Environment (getArgs)
@@ -39,7 +35,7 @@ import qualified System.Process as Process
 import qualified Text.ParserCombinators.ReadP as Read
 import           Turtle hiding (arg, fold, s, x)
 import qualified Turtle
-import           Types (PackageName, mkPackageName, runPackageName, untitledPackageName, preludePackageName)
+import           Types (PackageName, mkPackageName, runPackageName, untitledPackageName, preludePackageName, packageNameDhallType)
 
 echoT :: Text -> IO ()
 echoT = Turtle.printf (Turtle.s % "\n")
@@ -49,17 +45,20 @@ exitWithErr errText = errT errText >> exit (ExitFailure 1)
   where errT = traverse Turtle.err . textToLines
 
 packageFile :: Path.FilePath
-packageFile = "psc-package.json"
-
-localPackageSet :: Path.FilePath
-localPackageSet = "packages.json"
+packageFile = "psc-package.dhall"
 
 data PackageConfig = PackageConfig
-  { name    :: PackageName
-  , depends :: [PackageName]
-  , set     :: Text
-  , source  :: Text
-  } deriving (Show, Generic, Aeson.FromJSON, Aeson.ToJSON)
+  { name     :: PackageName
+  , depends  :: [PackageName]
+  , packages :: PackageSet
+  } deriving (Show)
+
+packageConfigDhallType :: Dhall.Type PackageConfig
+packageConfigDhallType =
+  Dhall.record $ PackageConfig
+    <$> Dhall.field "name" Types.packageNameDhallType
+    <*> Dhall.field "depends" (Dhall.list Types.packageNameDhallType)
+    <*> Dhall.field "packages" packageSetDhallType
 
 pathToTextUnsafe :: Turtle.FilePath -> Text
 pathToTextUnsafe = either (error "Path.toText failed") id . Path.toText
@@ -70,59 +69,55 @@ shellToIOText shellLines = Turtle.fold (fmap lineToText shellLines) Foldl.list
 readPackageFile :: IO PackageConfig
 readPackageFile = do
   exists <- testfile packageFile
-  unless exists $ exitWithErr "psc-package.json does not exist. Maybe you need to run psc-package init?"
-  mpkg <- Aeson.eitherDecodeStrict . encodeUtf8 <$> readTextFile packageFile
-  case mpkg of
-    Left errors -> exitWithErr $ "Unable to parse psc-package.json: " <> T.pack errors
-    Right pkg -> return pkg
+  unless exists $ exitWithErr "psc-package.dhall does not exist. Maybe you need to run psc-package init?"
+  Dhall.input packageConfigDhallType =<< readTextFile packageFile
 
-packageConfigToJSON :: PackageConfig -> Text
-packageConfigToJSON =
-    TL.toStrict
-    . TB.toLazyText
-    . encodePrettyToTextBuilder' config
-    . sortDependencies
+writeNewPackageFile :: PackageName -> [PackageName] -> Text -> IO ()
+writeNewPackageFile name depends packagesUrl = do
+  case Dhall.Parser.exprFromText "writeNewPackageFile Dhall input" contents of
+    Left errMsg -> exitWithErr $ T.append "Failed to convert writeNewPackageFile Dhall input to Dhall Expr: " (T.pack $ show errMsg)
+    Right expr -> writeTextFile packageFile $ Dhall.Core.pretty expr
+  Dhall.Format.format . Just . T.unpack . pathToTextUnsafe $ packageFile
   where
-    config = defConfig
-               { confCompare =
-                   keyOrder [ "name"
-                            , "set"
-                            , "source"
-                            , "depends"
-                            ]
-               , confIndent = Spaces 2
-               , confTrailingNewline = True
-               }
-    sortDependencies conf = conf { depends = List.sort (depends conf) }
-
-packageSetToJSON :: PackageSet -> Text
-packageSetToJSON =
-    TL.toStrict
-    . TB.toLazyText
-    . encodePrettyToTextBuilder' config
-    . sortDependencies
-  where
-    config = defConfig
-               { confCompare = compare
-               , confIndent = Spaces 2
-               , confTrailingNewline = True
-               }
-    sortDependencies set = updateDependencies <$> set
-    updateDependencies pkg =
-      pkg { dependencies = List.sort (dependencies pkg) }
-
-writePackageFile :: PackageConfig -> IO ()
-writePackageFile =
-  writeTextFile packageFile
-  . packageConfigToJSON
+    contents
+      = T.replace "%name" (runPackageName name)
+      . T.replace "%packages" packagesUrl
+      . T.replace "%depends" ("[" `T.append` T.intercalate "," (quote. runPackageName <$> depends) `T.append` "]")
+      $ "{name=\"%name\",packages=%packages,depends=%depends}"
+    quote s = "\"" `T.append` s `T.append` "\""
 
 data PackageInfo = PackageInfo
   { repo         :: Text
   , version      :: Text
   , dependencies :: [PackageName]
-  } deriving (Show, Eq, Generic, Aeson.FromJSON, Aeson.ToJSON)
+  } deriving (Show, Eq)
+
+packageInfoDhallType :: Dhall.Type PackageInfo
+packageInfoDhallType =
+  Dhall.record $ PackageInfo
+    <$> Dhall.field "repo" Dhall.auto
+    <*> Dhall.field "version" Dhall.auto
+    <*> Dhall.field "dependencies" (Dhall.list Types.packageNameDhallType)
 
 type PackageSet = Map.Map PackageName PackageInfo
+
+packageSetDhallType :: Dhall.Type PackageSet
+packageSetDhallType = Dhall.Type { extract, expected }
+  where
+    extract (Dhall.Core.RecordLit hm) = do
+      hm' <- HM.traverseWithKey decodeExpr hm
+      m <- traverse decodeKey $ HM.toList hm'
+      return $ Map.fromList m
+    extract _ = Nothing
+
+    expected = Dhall.Core.Record (HM.fromList [])
+
+    decodeExpr _key value = case Dhall.extract packageInfoDhallType value of
+      Just (x :: PackageInfo) -> return x
+      Nothing -> Nothing
+    decodeKey (key, value) = case mkPackageName key of
+      Right name -> return (name, value)
+      Left _ -> Nothing
 
 cloneShallow
   :: Text
@@ -155,40 +150,36 @@ listRemoteTags from = let gitProc = inproc "git"
                                     ] empty
                       in lineToText <$> gitProc
 
-getPackageSet :: PackageConfig -> IO ()
-getPackageSet PackageConfig{ source, set } = do
-  let pkgDir = ".psc-package" </> fromText set </> ".set"
-  exists <- testdir pkgDir
-  unless exists . void $ cloneShallow source set pkgDir
-
 readPackageSet :: PackageConfig -> IO PackageSet
-readPackageSet PackageConfig{ set } = do
-  let dbFile = ".psc-package" </> fromText set </> ".set" </> "packages.json"
-  handleReadPackageSet dbFile
+readPackageSet PackageConfig{ packages } = do
+  return packages
 
 handleReadPackageSet :: Path.FilePath -> IO PackageSet
 handleReadPackageSet dbFile = do
   exists <- testfile dbFile
   unless exists $ exitWithErr $ format (fp%" does not exist") dbFile
-  mdb <- Aeson.eitherDecodeStrict . encodeUtf8 <$> readTextFile dbFile
-  case mdb of
-    Left errors -> exitWithErr $ "Unable to parse packages.json: " <> T.pack errors
-    Right db -> return db
+  expr <- Dhall.inputExpr =<< readTextFile dbFile
+  case expr of
+    (Dhall.Core.RecordLit hm) -> do
+      hm' <- HM.traverseWithKey decodeExpr hm
+      m <- traverse decodeKey $ HM.toList hm'
+      return $ Map.fromList m
+    errMsg -> exitWithErr $
+      T.append
+        "The database was not of the correct type, it should have been a record of packages: "
+        (T.pack $ show errMsg)
 
-writePackageSet :: PackageConfig -> PackageSet -> IO ()
-writePackageSet PackageConfig{ set } =
-  let dbFile = ".psc-package" </> fromText set </> ".set" </> "packages.json"
-  in writeTextFile dbFile . packageSetToJSON
-
-readLocalPackageSet :: IO PackageSet
-readLocalPackageSet = handleReadPackageSet localPackageSet
-
-writeLocalPackageSet :: PackageSet -> IO ()
-writeLocalPackageSet = writeTextFile localPackageSet . packageSetToJSON
+  where
+    decodeExpr key value = case Dhall.extract packageInfoDhallType value of
+      Just (x :: PackageInfo) -> return x
+      Nothing -> exitWithErr $ T.append "Could not extract PackageInfo from " key
+    decodeKey (key, value) = case mkPackageName key of
+      Left errMsg -> exitWithErr $ T.append (T.append "Error in package " key) (T.pack $ show errMsg)
+      Right name -> return (name, value)
 
 performInstall :: Text -> PackageName -> PackageInfo -> IO Turtle.FilePath
 performInstall set pkgName PackageInfo{ repo, version } = do
-  let pkgDir = ".psc-package" </> fromText set </> fromText (runPackageName pkgName) </> fromText version
+  let pkgDir = ".psc-package" </> fromText set </> fromText (runPackageName pkgName) </> fromText version </> "src"
   exists <- testdir pkgDir
   unless exists . void $ do
     echoT ("Installing " <> runPackageName pkgName)
@@ -223,11 +214,10 @@ getTransitiveDeps db deps =
 
 installImpl :: PackageConfig -> IO ()
 installImpl config@PackageConfig{ depends } = do
-  getPackageSet config
   db <- readPackageSet config
   trans <- getTransitiveDeps db depends
   echoT ("Installing " <> pack (show (length trans)) <> " packages...")
-  forConcurrently_ trans . uncurry $ performInstall $ set config
+  forConcurrently_ trans . uncurry $ performInstall $ (const "set") config
 
 getPureScriptVersion :: IO Version
 getPureScriptVersion = do
@@ -240,60 +230,39 @@ getPureScriptVersion = do
       | otherwise -> exitWithErr "Unable to parse output of purs --version"
     _ -> exitWithErr "Unexpected output from purs --version"
 
-initialize :: Maybe (Text, Maybe Text) -> IO ()
-initialize setAndSource = do
-    exists <- testfile "psc-package.json"
-    when exists $ exitWithErr "psc-package.json already exists"
+initialize :: Maybe Text -> IO ()
+initialize packages = do
+    exists <- testfile "psc-package.dhall"
+    when exists $ exitWithErr "psc-package.dhall already exists"
     echoT "Initializing new project in current directory"
     pkgName <- packageNameFromPWD . pathToTextUnsafe . Path.filename <$> pwd
-    pkg <- case setAndSource of
+    (name, depends, packagesUrl) <- case packages of
       Nothing -> do
         pursVersion <- getPureScriptVersion
         echoT ("Using the default package set for PureScript compiler version " <>
           fromString (showVersion pursVersion))
         echoT "(Use --source / --set to override this behavior)"
-        pure PackageConfig { name    = pkgName
-                           , depends = [ preludePackageName ]
-                           , source  = "https://github.com/purescript/package-sets.git"
-                           , set     = "psc-" <> pack (showVersion pursVersion)
-                           }
-      Just (set, source) ->
-        pure PackageConfig { name    = pkgName
-                           , depends = [ preludePackageName ]
-                           , source  = fromMaybe "https://github.com/purescript/package-sets.git" source
-                           , set
-                           }
+        pure ( pkgName
+             , [ preludePackageName ]
+             , "https://raw.githubusercontent.com/justinwoo/spacchetti/8d53f91d9ee32ffc4fc2f755163b80f9026388cd/src/packages.dhall"
+             )
+      Just packagesUrl ->
+        pure ( pkgName
+             , [ preludePackageName ]
+             , packagesUrl
+             )
 
-    writePackageFile pkg
-    installImpl pkg
+    writeNewPackageFile name depends packagesUrl
+    installImpl =<< readPackageFile
   where
     packageNameFromPWD =
       either (const untitledPackageName) id . mkPackageName
 
-install :: Maybe String -> IO ()
-install pkgName' = do
+install :: IO ()
+install = do
   pkg <- readPackageFile
-  case pkgName' of
-    Nothing -> do
-      installImpl pkg
-      echoT "Install complete"
-    Just str -> do
-      pkgName <- packageNameFromString str
-      let pkg' = pkg { depends = List.nub (pkgName : depends pkg) }
-      updateAndWritePackageFile pkg'
-
-uninstall :: String -> IO ()
-uninstall pkgName' = do
-  pkg <- readPackageFile
-  pkgName <- packageNameFromString pkgName'
-  let pkg' = pkg { depends = filter (/= pkgName) $ depends pkg }
-  updateAndWritePackageFile pkg'
-
-updateAndWritePackageFile :: PackageConfig -> IO ()
-updateAndWritePackageFile pkg = do
   installImpl pkg
-  writePackageFile pkg
-  echoT "psc-package.json file was updated"
+  echoT "Install complete"
 
 packageNameFromString :: String -> IO PackageName
 packageNameFromString str =
@@ -333,7 +302,7 @@ getSourcePaths :: PackageConfig -> PackageSet -> [PackageName] -> IO [Turtle.Fil
 getSourcePaths PackageConfig{..} db pkgNames = do
   trans <- getTransitiveDeps db pkgNames
   let paths = [ ".psc-package"
-                </> fromText set
+                </> fromText "set"
                 </> fromText (runPackageName pkgName)
                 </> fromText version
                 </> "src" </> "**" </> "*.purs"
@@ -375,84 +344,6 @@ exec execNames onlyDeps passthroughOptions = do
           Nothing -- use existing stdout
           Nothing -- use existing stderr
 
-checkForUpdates :: Bool -> Bool -> IO ()
-checkForUpdates applyMinorUpdates applyMajorUpdates = do
-    pkg <- readPackageFile
-    db <- readPackageSet pkg
-
-    echoT ("Checking " <> pack (show (Map.size db)) <> " packages for updates.")
-    echoT "Warning: this could take some time!"
-
-    newDb <- Map.fromList <$> for (Map.toList db) (\(name, p@PackageInfo{ repo, version }) -> do
-      echoT ("Checking package " <> runPackageName name)
-      tagLines <- Turtle.fold (listRemoteTags repo) Foldl.list
-      let tags = mapMaybe parseTag tagLines
-      newVersion <- case parsePackageVersion version of
-        Just parts ->
-          let applyMinor =
-                case filter (isMinorReleaseFrom parts) tags of
-                  [] -> pure version
-                  minorReleases -> do
-                    echoT "New minor release available"
-                    if applyMinorUpdates
-                      then do
-                        let latestMinorRelease = maximum minorReleases
-                        pure ("v" <> T.intercalate "." (map (pack . show) latestMinorRelease))
-                      else pure version
-              applyMajor =
-                case filter (isMajorReleaseFrom parts) tags of
-                  [] -> applyMinor
-                  newReleases -> do
-                    echoT "New major release available"
-                    if applyMajorUpdates
-                      then do
-                        let latestRelease = maximum newReleases
-                        pure ("v" <> T.intercalate "." (map (pack . show) latestRelease))
-                      else applyMinor
-          in applyMajor
-        _ -> do
-          echoT "Unable to parse version string"
-          pure version
-      pure (name, p { version = newVersion }))
-
-    when (applyMinorUpdates || applyMajorUpdates)
-      (writePackageSet pkg newDb)
-  where
-    parseTag :: Text -> Maybe [Int]
-    parseTag line =
-      case T.splitOn "\t" line of
-        [_sha, ref] ->
-          case T.stripPrefix "refs/tags/" ref of
-            Just tag ->
-              case parsePackageVersion tag of
-                Just parts -> pure parts
-                _ -> Nothing
-            _ -> Nothing
-        _ -> Nothing
-
-    parsePackageVersion :: Text -> Maybe [Int]
-    parsePackageVersion ref =
-      case T.stripPrefix "v" ref of
-        Just tag ->
-          traverse parseDecimal (T.splitOn "." tag)
-        _ -> Nothing
-
-    parseDecimal :: Text -> Maybe Int
-    parseDecimal s =
-      case TR.decimal s of
-        Right (n, "") -> Just n
-        _ -> Nothing
-
-    isMajorReleaseFrom :: [Int] -> [Int] -> Bool
-    isMajorReleaseFrom (0 : xs) (0 : ys) = isMajorReleaseFrom xs ys
-    isMajorReleaseFrom (x : _)  (y : _)  = y > x
-    isMajorReleaseFrom _        _        = False
-
-    isMinorReleaseFrom :: [Int] -> [Int] -> Bool
-    isMinorReleaseFrom (0 : xs) (0 : ys) = isMinorReleaseFrom xs ys
-    isMinorReleaseFrom (x : xs) (y : ys) = y == x && ys > xs
-    isMinorReleaseFrom _        _        = False
-
 data VerifyArgs a = Package a | VerifyAll (Maybe a) deriving (Functor, Foldable, Traversable)
 
 verify :: VerifyArgs Text -> IO ()
@@ -481,21 +372,17 @@ verify arg = do
       traverse_ (verifyPackage db pkg) names
 
     verifyPackage :: PackageSet -> PackageConfig -> PackageName -> IO ()
-    verifyPackage db pkg name = do
+    verifyPackage db _pkg name = do
       let
         dirFor pkgName =
           case Map.lookup pkgName db of
             Nothing -> error ("verifyPackageSet: no directory for " <> show pkgName)
-            Just pkgInfo -> performInstall (set pkg) pkgName pkgInfo
+            Just pkgInfo -> performInstall "set" pkgName pkgInfo
       echoT ("Verifying package " <> runPackageName name)
       dependencies <- map fst <$> getTransitiveDeps db [name]
       dirs <- mapConcurrently dirFor dependencies
       let srcGlobs = map (pathToTextUnsafe . (</> ("src" </> "**" </> "*.purs"))) dirs
       procs "purs" ("compile" : srcGlobs) empty
-
-formatPackageFile :: IO ()
-formatPackageFile =
-    readLocalPackageSet >>= writeLocalPackageSet
 
 main :: IO ()
 main = do
@@ -521,15 +408,11 @@ main = do
     commands :: Parser (IO ())
     commands = (Opts.subparser . fold)
         [ Opts.command "init"
-            (Opts.info (initialize <$> optional ((,) <$> (fromString <$> set)
-                                                     <*> optional (fromString <$> source))
+            (Opts.info (initialize <$> optional (fromString <$> set)
                                    Opts.<**> Opts.helper)
-            (Opts.progDesc "Create a new psc-package.json file"))
-        , Opts.command "uninstall"
-            (Opts.info (uninstall <$> pkg Opts.<**> Opts.helper)
-            (Opts.progDesc "Uninstall the named package"))
+            (Opts.progDesc "Create a new psc-package.dhall file"))
         , Opts.command "install"
-            (Opts.info (install <$> optional pkg Opts.<**> Opts.helper)
+            (Opts.info (pure install)
             (Opts.progDesc "Install/update the named package and add it to 'depends' if not already listed. If no package is specified, install/update all dependencies."))
         , Opts.command "build"
             (Opts.info (exec ["purs", "compile"]
@@ -552,39 +435,21 @@ main = do
         , Opts.command "available"
             (Opts.info (listPackages <$> sorted Opts.<**> Opts.helper)
             (Opts.progDesc "List all packages available in the package set"))
-        , Opts.command "updates"
-            (Opts.info (checkForUpdates <$> apply <*> applyMajor Opts.<**> Opts.helper)
-            (Opts.progDesc "Check all packages in the package set for new releases"))
         , Opts.command "verify"
             (Opts.info (verify <$>
                         ((Package . fromString <$> pkg)
                          <|> (VerifyAll <$> optional (fromString <$> after)))
                         Opts.<**> Opts.helper)
             (Opts.progDesc "Verify that the named package builds correctly. If no package is specified, verify that all packages in the package set build correctly."))
-        , Opts.command "format"
-            (Opts.info (pure formatPackageFile)
-            (Opts.progDesc "Format the packages.json file for consistency"))
         ]
       where
         pkg = Opts.strArgument $
              Opts.metavar "PACKAGE"
           <> Opts.help "The name of the package to install"
 
-        source = Opts.strOption $
-             Opts.long "source"
-          <> Opts.help "The Git repository for the package set"
-
         set = Opts.strOption $
              Opts.long "set"
           <> Opts.help "The package set tag name"
-
-        apply = Opts.switch $
-             Opts.long "apply"
-          <> Opts.help "Apply all minor package updates"
-
-        applyMajor = Opts.switch $
-             Opts.long "apply-breaking"
-          <> Opts.help "Apply all major package updates"
 
         onlyDeps help = Opts.switch $
              Opts.long "only-dependencies"

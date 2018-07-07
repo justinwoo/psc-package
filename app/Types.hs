@@ -1,7 +1,9 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Types
   ( PackageName
+  , packageNameDhallType
   , mkPackageName
   , runPackageName
   , preludePackageName
@@ -9,39 +11,24 @@ module Types
   ) where
 
 import           Control.Category ((>>>))
-import           Data.Aeson (FromJSON, ToJSON, FromJSONKey(..), ToJSONKey(..), ToJSONKeyFunction(..), FromJSONKeyFunction(..), parseJSON, toJSON, withText)
-import qualified Data.Aeson.Encoding as AesonEncoding
 import           Data.Char (isAscii, isLower, isDigit)
-import           Data.Monoid ((<>))
 import           Data.Text (Text)
 import qualified Data.Text as T
+import qualified Dhall as Dhall
+import qualified Dhall.Core as Dhall.Core
 
 newtype PackageName
   = PackageName Text
   deriving (Show, Eq, Ord)
 
-instance ToJSON PackageName where
-  toJSON (PackageName t) = toJSON t
-
-instance FromJSON PackageName where
-  parseJSON =
-    withText "package name" fromText
-
-fromText :: Monad m => Text -> m PackageName
-fromText t =
-  case mkPackageName t of
-    Right pkgName -> pure pkgName
-    Left errs -> fail $ "Invalid package name: " <> show errs
-
-instance ToJSONKey PackageName where
-  toJSONKey =
-    ToJSONKeyText
-      runPackageName
-      (AesonEncoding.text . runPackageName)
-
-instance FromJSONKey PackageName where
-  fromJSONKey =
-    FromJSONKeyTextParser fromText
+packageNameDhallType :: Dhall.Type PackageName
+packageNameDhallType = Dhall.Type { Dhall.extract = extract, Dhall.expected = expected }
+  where
+    extract (Dhall.Core.TextLit (Dhall.Core.Chunks [] t)) = case mkPackageName t of
+      Right pkgName -> return pkgName
+      Left _ -> Nothing
+    extract _ = Nothing
+    expected = Dhall.Core.Text
 
 data PackageNameError
   = NotEmpty
