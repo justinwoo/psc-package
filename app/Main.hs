@@ -383,6 +383,9 @@ listSourcePaths = do
   paths <- getPaths
   traverse_ (echoT . pathToTextUnsafe) paths
 
+transformPath :: Turtle.FilePath -> String
+transformPath = (\x -> "\"" <> x <> "\"") . Path.encodeString
+
 -- | Helper for calling through to @purs@
 --
 -- Extra args will be appended to the options
@@ -398,7 +401,7 @@ exec execNames onlyDeps passthroughOptions limitJobs = do
     =<< Process.runCommand
           (unwords
             (execNames <> passthroughOptions
-                       <> map Path.encodeString (srcParts <> paths)))
+                       <> map transformPath (srcParts <> paths)))
 
 checkForUpdates :: Bool -> Bool -> IO ()
 checkForUpdates applyMinorUpdates applyMajorUpdates = do
@@ -519,8 +522,9 @@ verify arg limitJobs = do
         Just max' -> do
           sem <- newQSem max'
           mapConcurrently (bracket_ (waitQSem sem) (signalQSem sem) . dirFor) dependencies
-      let srcGlobs = map (pathToTextUnsafe . (</> ("src" </> "**" </> "*.purs"))) dirs
-      shells ("purs compile" <> " " <>  T.intercalate " " srcGlobs) empty
+      let _srcGlobs = map (pathToTextUnsafe . (</> ("src" </> "**" </> "*.purs"))) dirs
+          srcGlobs = map (\x -> "\"" <> x <> "\"") _srcGlobs
+      shells ("purs compile " <> T.intercalate " " srcGlobs) empty
 
 formatPackageFile :: IO ()
 formatPackageFile =
